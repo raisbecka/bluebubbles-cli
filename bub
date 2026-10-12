@@ -1,0 +1,731 @@
+#!/usr/bin/env python3
+"""
+bub — CLI for the BlueBubbles Server REST API.
+
+Stdlib-only (no pip deps) so it runs anywhere Python 3.8+ does,
+including a bare docker container.
+
+Config resolution (first wins):
+  1. CLI flags:  --host --port --scheme --password
+  2. Env vars:   BLUEBUBBLES_HOST BLUEBUBBLES_PORT BLUEBUBBLES_SCHEME BLUEBUBBLES_PASSWORD
+  3. Config file: $BUB_CONFIG, ~/.config/bub/config.json, ~/.bubrc
+     {"host": "127.0.0.1", "port": "1234", "scheme": "http", "password": "..."}
+
+Output: pretty JSON on stdout by default; --compact for single-line.
+Exit codes: 0 ok, 1 API error, 2 usage/config error.
+"""
+
+import argparse
+import io
+import json
+import mimetypes
+import os
+import socket
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime
+
+API = "/api/v1"
+
+
+# ---------------------------------------------------------------- config
+
+def load_config_file():
+    candidates = [
+        os.environ.get("BUB_CONFIG"),
+        os.path.expanduser("~/.config/bub/config.json"),
+        os.path.expanduser("~/.bubrc"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                die(f"bad config file {path}: {e}", 2)
+    return {}
+
+
+class Ctx:
+    def __init__(self, args):
+        cfg = load_config_file()
+        self.host = args.host or os.environ.get("BLUEBUBBLES_HOST") or cfg.get("host") or "127.0.0.1"
+        self.port = str(args.port or os.environ.get("BLUEBUBBLES_PORT") or cfg.get("port") or "1234")
+        self.scheme = (args.scheme or os.environ.get("BLUEBUBBLES_SCHEME") or cfg.get("scheme") or "http").rstrip("/")
+        self.password = args.password or os.environ.get("BLUEBUBBLES_PASSWORD") or cfg.get("password")
+        if not self.password:
+            die("no API password: use --password, BLUEBUBBLES_PASSWORD, or a config file", 2)
+        self.base = f"{self.scheme}://{self.host}:{self.port}"
+
+
+def die(msg, code=1):
+    print(f"bub: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def out(data, compact):
+    text = json.dumps(data, indent=None if compact else 2, ensure_ascii=False, default=str)
+    print(text)
+
+
+# ---------------------------------------------------------------- http
+
+def http(ctx, method, path, params=None, body=None, headers=None, raw_body=None,
+         content_type=None, binary=False):
+    """Perform an API request. Returns (status, parsed-or-bytes)."""
+    timeout = int(os.environ.get("BUB_TIMEOUT", "300"))
+    q = {"password": ctx.password}
+    if params:
+        q.update({k: v for k, v in params.items() if v is not None})
+    url = ctx.base + path + ("?" + urllib.parse.urlencode(q) if q else "")
+
+    if raw_body is not None:
+        data = raw_body
+    elif body is not None:
+        data = json.dumps(body).encode()
+        content_type = "application/json"
+    else:
+        data = None
+
+    req = urllib.request.Request(url, data=data, method=method)
+    if content_type:
+        req.add_header("Content-Type", content_type)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = resp.read()
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        payload = e.read()
+        status = e.code
+    except urllib.error.URLError as e:
+        die(f"cannot reach {ctx.base}: {e.reason}", 2)
+    except (socket.timeout, TimeoutError) as e:
+        die(f"timed out after {timeout}s on {method} {path} — the server is still "
+            f"working (AppleScript sends can be slow); the message may have gone through", 2)
+
+    if binary:
+        return status, payload
+    try:
+        return status, json.loads(payload.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return status, payload.decode("utf-8", "replace")
+
+
+def api(ctx, method, path, **kw):
+    status, data = http(ctx, method, API + path, **kw)
+    if status >= 400:
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict) and err.get("message"):
+                msg = f"{data.get('message', '')} ({err['message']})"
+            else:
+                msg = data.get("message") or json.dumps(data)
+        else:
+            msg = str(data)[:500]
+        die(f"API {status} on {method} {path}: {msg}")
+    return data
+
+
+def multipart(fields, files):
+    """Build a multipart/form-data body. fields: list[(name, value)],
+    files: list[(name, filename, bytes)]. Returns (body_bytes, content_type)."""
+    boundary = uuid.uuid4().hex
+    buf = io.BytesIO()
+    for name, value in fields:
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        buf.write(f"{value}\r\n".encode())
+    for name, filename, content in files:
+        ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        buf.write(f"--{boundary}\r\n".encode())
+        buf.write(f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode())
+        buf.write(f"Content-Type: {ctype}\r\n\r\n".encode())
+        buf.write(content)
+        buf.write(b"\r\n")
+    buf.write(f"--{boundary}--\r\n".encode())
+    return buf.getvalue(), f"multipart/form-data; boundary={boundary}"
+
+
+# ---------------------------------------------------------------- helpers
+
+def address_to_guid(addr):
+    """Turn a phone/email into a 1:1 chat GUID; pass through existing GUIDs."""
+    if ";" in addr:
+        return addr
+    if addr.startswith("+") or any(c.isdigit() for c in addr):
+        return f"iMessage;+;{addr.lstrip('+')}"
+    return f"iMessage;-;{addr}"
+
+
+def parse_when(s):
+    """Parse a local time string to epoch milliseconds."""
+    s = s.strip()
+    if s.isdigit():
+        v = int(s)
+        return v if v > 10_000_000_000 else v * 1000  # seconds vs ms
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(s, fmt).timestamp() * 1000)
+        except ValueError:
+            pass
+    die(f"cannot parse time {s!r} (use e.g. '2026-10-13 09:30' or epoch seconds)", 2)
+
+
+def ts(ms):
+    if isinstance(ms, (int, float)):
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    return ms
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_ping(ctx, a):
+    out(api(ctx, "GET", "/ping"), a.compact)
+
+
+def cmd_info(ctx, a):
+    out(api(ctx, "GET", "/server/info"), a.compact)
+
+
+def cmd_stats(ctx, a):
+    out(api(ctx, "GET", "/server/statistics/totals"), a.compact)
+
+
+def cmd_logs(ctx, a):
+    out(api(ctx, "GET", "/server/logs"), a.compact)
+
+
+def cmd_alerts(ctx, a):
+    out(api(ctx, "GET", "/server/alert"), a.compact)
+
+
+def cmd_update_check(ctx, a):
+    out(api(ctx, "GET", "/server/update/check"), a.compact)
+
+
+# --- chats
+
+def cmd_chats_list(ctx, a):
+    body = {"limit": a.limit, "offset": a.offset, "sort": a.sort,
+            "with": ["lastMessage", "sms", "archived"]}
+    data = api(ctx, "POST", "/chat/query", body=body)
+    out(data, a.compact)
+
+
+def cmd_chats_get(ctx, a):
+    data = api(ctx, "GET", f"/chat/{urllib.parse.quote(a.guid)}",
+               params={"with": a.with_ or "participants,lastmessage"})
+    out(data, a.compact)
+
+
+def cmd_chats_messages(ctx, a):
+    data = api(ctx, "GET", f"/chat/{urllib.parse.quote(a.guid)}/message",
+               params={"with": a.with_ or "participants,attachment,handle"})
+    out(data, a.compact)
+
+
+def cmd_chats_search(ctx, a):
+    body = {"limit": a.limit, "offset": 0, "sort": "lastmessage",
+            "with": ["lastMessage", "participants"],
+            "where": [{"statement": "chat.displayName LIKE :q", "args": {"q": f"%{a.text}%"}}]}
+    out(api(ctx, "POST", "/chat/query", body=body), a.compact)
+
+
+def cmd_chats_new(ctx, a):
+    body = {"addresses": [address_to_guid(x) for x in a.addresses]}
+    if a.message:
+        body["message"] = a.message
+    out(api(ctx, "POST", "/chat/new", body=body), a.compact)
+
+
+def cmd_chats_rename(ctx, a):
+    out(api(ctx, "PUT", f"/chat/{urllib.parse.quote(a.guid)}", body={"displayName": a.name}), a.compact)
+
+
+def cmd_chats_add_participant(ctx, a):
+    out(api(ctx, "POST", f"/chat/{urllib.parse.quote(a.guid)}/participant",
+            body={"address": address_to_guid(a.address)}), a.compact)
+
+
+def cmd_chats_remove_participant(ctx, a):
+    out(api(ctx, "DELETE", f"/chat/{urllib.parse.quote(a.guid)}/participant",
+            body={"address": address_to_guid(a.address)}), a.compact)
+
+
+def cmd_chats_delete(ctx, a):
+    out(api(ctx, "DELETE", f"/chat/{urllib.parse.quote(a.guid)}"), a.compact)
+
+
+# --- messages
+
+def cmd_messages_send(ctx, a):
+    chat_guid = address_to_guid(a.chat)
+    if a.attach:
+        if a.dry_run:
+            out({"dryRun": True, "action": "send-multipart", "chatGuid": chat_guid,
+                 "text": a.text, "attachments": a.attach}, a.compact)
+            return
+        for path in a.attach:
+            if not os.path.exists(path):
+                die(f"attachment not found: {path}", 2)
+        # upload each file, then send multipart (text + attachments)
+        parts = []
+        if a.text:
+            parts.append({"partIndex": 0, "text": a.text})
+        idx = 1 if a.text else 0
+        for path in a.attach:
+            with open(path, "rb") as f:
+                body, ctype = multipart([], [("attachment", os.path.basename(path), f.read())])
+            status, data = http(ctx, "POST", API + "/attachment/upload",
+                                raw_body=body, content_type=ctype)
+            if status >= 400:
+                die(f"upload failed ({status}): {data}")
+            att = data.get("data", {}).get("attachment") or data.get("data")
+            att_guid = att.get("guid") if isinstance(att, dict) else att
+            if not att_guid:
+                die(f"upload did not return a guid: {data}")
+            parts.append({"partIndex": idx, "attachment": att_guid,
+                          "name": os.path.basename(path)})
+            idx += 1
+        body = {"chatGuid": chat_guid, "parts": parts}
+        if a.effect:
+            body["effectId"] = a.effect
+        out(api(ctx, "POST", "/message/multipart", body=body), a.compact)
+        return
+
+    body = {"chatGuid": chat_guid, "tempGuid": str(uuid.uuid4()), "message": a.text,
+            "method": a.method}
+    if a.effect:
+        body["effectId"] = a.effect
+    if a.reply_to:
+        body["selectedMessageGuid"] = a.reply_to
+    if a.dry_run:
+        out({"dryRun": True, "action": "send-text", "body": body}, a.compact)
+        return
+    out(api(ctx, "POST", "/message/text", body=body), a.compact)
+
+
+def resolve_chat_guid(ctx, addr):
+    """Resolve an address to the real chat GUID from the server DB."""
+    data = api(ctx, "POST", "/handle/query",
+               body={"limit": 5, "offset": 0, "with": ["chat", "chat.participants"],
+                     "address": addr})
+    for h in data.get("data", []):
+        # server nests the chat(s) under a "chats" list
+        chats = h.get("chats")
+        if isinstance(chats, list):
+            for chat in chats:
+                if isinstance(chat, dict) and chat.get("guid"):
+                    return chat["guid"]
+        chat = h.get("chat")
+        if isinstance(chat, dict) and chat.get("guid"):
+            return chat["guid"]
+    return address_to_guid(addr)
+
+
+def cmd_messages_list(ctx, a):
+    body = {"limit": a.limit, "offset": a.offset, "sort": a.sort,
+            "with": ["chat", "chat.participants", "attachment", "handle", "sms"]}
+    if a.chat:
+        body["chatGuid"] = resolve_chat_guid(ctx, a.chat)
+    out(api(ctx, "POST", "/message/query", body=body), a.compact)
+
+
+def cmd_messages_search(ctx, a):
+    body = {"limit": a.limit, "offset": 0, "sort": "DESC",
+            "with": ["chat", "attachment", "handle"],
+            "where": [{"statement": "message.text LIKE :q", "args": {"q": f"%{a.text}%"}}]}
+    out(api(ctx, "POST", "/message/query", body=body), a.compact)
+
+
+def cmd_messages_get(ctx, a):
+    data = api(ctx, "GET", f"/message/{urllib.parse.quote(a.guid)}",
+               params={"with": "chats,participants,attachment,handle"})
+    out(data, a.compact)
+
+
+def cmd_messages_react(ctx, a):
+    body = {"chatGuid": address_to_guid(a.chat), "selectedMessageGuid": a.message,
+            "reaction": a.reaction}
+    if a.part_index is not None:
+        body["partIndex"] = a.part_index
+    out(api(ctx, "POST", "/message/react", body=body), a.compact)
+
+
+def cmd_messages_edit(ctx, a):
+    body = {"editedMessage": a.text, "backwardsCompatibilityMessage": f"Edited to “{a.text}”"}
+    if a.part_index is not None:
+        body["partIndex"] = a.part_index
+    out(api(ctx, "POST", f"/message/{urllib.parse.quote(a.guid)}/edit", body=body), a.compact)
+
+
+def cmd_messages_unsend(ctx, a):
+    body = {}
+    if a.part_index is not None:
+        body["partIndex"] = a.part_index
+    out(api(ctx, "POST", f"/message/{urllib.parse.quote(a.guid)}/unsend", body=body), a.compact)
+
+
+# --- attachments
+
+def cmd_attach_download(ctx, a):
+    dest = a.output
+    if not dest:
+        status, meta = http(ctx, "GET", API + f"/attachment/{urllib.parse.quote(a.guid)}")
+        if status >= 400:
+            die(f"cannot fetch attachment metadata: {meta}")
+        att = meta.get("data", {}).get("attachment", {})
+        name = att.get("fileName") or att.get("name") or a.guid
+        dest = os.path.basename(str(name))
+    status, payload = http(ctx, "GET", API + f"/attachment/{urllib.parse.quote(a.guid)}/download",
+                           binary=True)
+    if status >= 400:
+        die(f"download failed ({status}): {str(payload)[:300]}")
+    with open(dest, "wb") as f:
+        f.write(payload)
+    out({"saved": os.path.abspath(dest), "bytes": len(payload)}, a.compact)
+
+
+def cmd_attach_send(ctx, a):
+    if not os.path.exists(a.file):
+        die(f"file not found: {a.file}", 2)
+    if a.dry_run:
+        out({"dryRun": True, "action": "send-attachment",
+             "chatGuid": address_to_guid(a.chat), "file": a.file}, a.compact)
+        return
+    with open(a.file, "rb") as f:
+        content = f.read()
+    fields = [("chatGuid", address_to_guid(a.chat)), ("tempGuid", str(uuid.uuid4())),
+              ("name", os.path.basename(a.file)),
+              ("method", a.method or "apple-script")]
+    body, ctype = multipart(fields, [("attachment", os.path.basename(a.file), content)])
+    status, data = http(ctx, "POST", API + "/message/attachment",
+                        raw_body=body, content_type=ctype)
+    if status >= 400:
+        die(f"send failed ({status}): {data}")
+    out(data, a.compact)
+
+
+# --- contacts
+
+def cmd_contacts_list(ctx, a):
+    data = api(ctx, "GET", "/contact")
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        contacts = payload.get("contacts", [])
+    elif isinstance(payload, list):
+        contacts = payload
+    else:
+        contacts = []
+    if isinstance(contacts, dict):
+        contacts = list(contacts.values())
+    if a.search:
+        q = a.search.lower()
+        contacts = [c for c in contacts
+                    if q in json.dumps(c, ensure_ascii=False).lower()]
+    if a.limit:
+        contacts = contacts[:a.limit]
+    out({"count": len(contacts), "contacts": contacts}, a.compact)
+
+
+def cmd_contacts_get(ctx, a):
+    data = api(ctx, "GET", "/icloud/contact", params={"address": a.address})
+    out(data, a.compact)
+
+
+def cmd_contacts_query(ctx, a):
+    out(api(ctx, "POST", "/contact/query", body={"addresses": a.addresses}), a.compact)
+
+
+# --- handles
+
+def cmd_handles_get(ctx, a):
+    out(api(ctx, "GET", f"/handle/{urllib.parse.quote(a.address)}"), a.compact)
+
+
+def cmd_handles_availability(ctx, a):
+    kind = "imessage" if a.kind == "imessage" else "facetime"
+    out(api(ctx, "GET", f"/handle/availability/{kind}", params={"address": a.address}), a.compact)
+
+
+def cmd_handles_query(ctx, a):
+    body = {"limit": a.limit, "offset": 0, "with": ["chat", "chat.participants"]}
+    if a.address:
+        body["address"] = a.address
+    out(api(ctx, "POST", "/handle/query", body=body), a.compact)
+
+
+# --- scheduled messages
+
+def cmd_schedule_list(ctx, a):
+    out(api(ctx, "GET", "/message/schedule"), a.compact)
+
+
+def cmd_schedule_get(ctx, a):
+    out(api(ctx, "GET", f"/message/schedule/{a.id}"), a.compact)
+
+
+def cmd_schedule_create(ctx, a):
+    body = {
+        "type": "send-message",
+        "payload": {"chatGuid": address_to_guid(a.chat), "message": a.text,
+                    "method": a.method},
+        "scheduledFor": parse_when(a.at),
+        "schedule": {"type": "once"},
+    }
+    out(api(ctx, "POST", "/message/schedule", body=body), a.compact)
+
+
+def cmd_schedule_update(ctx, a):
+    body = {"scheduledFor": parse_when(a.at)}
+    out(api(ctx, "PUT", f"/message/schedule/{a.id}", body=body), a.compact)
+
+
+def cmd_schedule_delete(ctx, a):
+    out(api(ctx, "DELETE", f"/message/schedule/{a.id}"), a.compact)
+
+
+# --- find my
+
+def cmd_findmy_devices(ctx, a):
+    out(api(ctx, "GET", "/icloud/findmy/devices"), a.compact)
+
+
+def cmd_findmy_friends(ctx, a):
+    out(api(ctx, "GET", "/icloud/findmy/friends"), a.compact)
+
+
+# --- escape hatch
+
+def cmd_raw(ctx, a):
+    params = {}
+    for kv in a.params or []:
+        k, _, v = kv.partition("=")
+        params[k] = v
+    out(api(ctx, a.method.upper(), a.path, params=params,
+            body=json.loads(a.body) if a.body else None), a.compact)
+
+
+# ---------------------------------------------------------------- parser
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="bub",
+        description="BlueBubbles Server REST API CLI (JSON out, stdlib-only).")
+    p.add_argument("--host", help="server host (default: BLUEBUBBLES_HOST or 127.0.0.1)")
+    p.add_argument("--port", help="server port (default: BLUEBUBBLES_PORT or 1234)")
+    p.add_argument("--scheme", help="http or https (default: BLUEBUBBLES_SCHEME or http)")
+    p.add_argument("--password", help="API password (default: BLUEBUBBLES_PASSWORD)")
+    p.add_argument("--compact", action="store_true", help="single-line JSON output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    for name, fn, help_ in [
+        ("ping", cmd_ping, "health check"),
+        ("info", cmd_info, "server metadata (version, iMessage account, etc)"),
+        ("stats", cmd_stats, "iMessage entity totals"),
+        ("logs", cmd_logs, "server logs"),
+        ("alerts", cmd_alerts, "server alerts"),
+        ("update-check", cmd_update_check, "check for server updates"),
+    ]:
+        sp = sub.add_parser(name, help=help_)
+        sp.set_defaults(fn=fn)
+
+    # chats
+    c = sub.add_parser("chats", help="chat operations").add_subparsers(dest="sub", required=True)
+
+    sp = c.add_parser("list", help="list chats (query, paginated)")
+    sp.add_argument("--limit", type=int, default=100)
+    sp.add_argument("--offset", type=int, default=0)
+    sp.add_argument("--sort", default="lastmessage")
+    sp.set_defaults(fn=cmd_chats_list)
+
+    sp = c.add_parser("get", help="get chat by GUID")
+    sp.add_argument("guid")
+    sp.add_argument("--with", dest="with_", default=None,
+                    help="e.g. participants,lastmessage")
+    sp.set_defaults(fn=cmd_chats_get)
+
+    sp = c.add_parser("messages", help="all messages in a chat")
+    sp.add_argument("guid")
+    sp.add_argument("--with", dest="with_", default=None)
+    sp.set_defaults(fn=cmd_chats_messages)
+
+    sp = c.add_parser("search", help="search chats by display name")
+    sp.add_argument("text")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(fn=cmd_chats_search)
+
+    sp = c.add_parser("new", help="start a new chat (optionally with a message)")
+    sp.add_argument("addresses", nargs="+", help="phone numbers / emails / chat GUIDs")
+    sp.add_argument("--message", default=None)
+    sp.set_defaults(fn=cmd_chats_new)
+
+    sp = c.add_parser("rename", help="set a chat's display name")
+    sp.add_argument("guid")
+    sp.add_argument("name")
+    sp.set_defaults(fn=cmd_chats_rename)
+
+    sp = c.add_parser("add-participant", help="add a participant to a group chat")
+    sp.add_argument("guid")
+    sp.add_argument("address")
+    sp.set_defaults(fn=cmd_chats_add_participant)
+
+    sp = c.add_parser("remove-participant", help="remove a participant from a group chat")
+    sp.add_argument("guid")
+    sp.add_argument("address")
+    sp.set_defaults(fn=cmd_chats_remove_participant)
+
+    sp = c.add_parser("delete", help="delete a chat")
+    sp.add_argument("guid")
+    sp.set_defaults(fn=cmd_chats_delete)
+
+    # messages
+    m = sub.add_parser("messages", help="message operations").add_subparsers(dest="sub", required=True)
+
+    sp = m.add_parser("send", help="send a text (and optional attachments)")
+    sp.add_argument("chat", help="chat GUID, phone number, or email")
+    sp.add_argument("text", nargs="?", default="", help="message text")
+    sp.add_argument("--attach", nargs="*", default=[], help="file(s) to send with the text")
+    sp.add_argument("--effect", default=None, help="effect ID (e.g. com.apple.effect.symbols-balloon)")
+    sp.add_argument("--reply-to", default=None, help="message GUID to reply to (needs private API)")
+    sp.add_argument("--method", default="apple-script", choices=["apple-script", "private-api"])
+    sp.add_argument("--dry-run", action="store_true", help="print the payload, send nothing")
+    sp.set_defaults(fn=cmd_messages_send)
+
+    sp = m.add_parser("list", help="recent messages (query, paginated)")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--offset", type=int, default=0)
+    sp.add_argument("--sort", default="DESC")
+    sp.add_argument("--chat", default=None, help="restrict to one chat GUID/number/email")
+    sp.set_defaults(fn=cmd_messages_list)
+
+    sp = m.add_parser("search", help="search message text (LIKE)")
+    sp.add_argument("text")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.set_defaults(fn=cmd_messages_search)
+
+    sp = m.add_parser("get", help="get a message by GUID")
+    sp.add_argument("guid")
+    sp.set_defaults(fn=cmd_messages_get)
+
+    sp = m.add_parser("react", help="react to a message (emoji)")
+    sp.add_argument("chat", help="chat GUID/number/email")
+    sp.add_argument("message", help="GUID of the message to react to")
+    sp.add_argument("reaction", help="e.g. ❤️, 👍, 😂")
+    sp.add_argument("--part-index", type=int, default=None)
+    sp.set_defaults(fn=cmd_messages_react)
+
+    sp = m.add_parser("edit", help="edit a message (needs private API)")
+    sp.add_argument("guid")
+    sp.add_argument("text")
+    sp.add_argument("--part-index", type=int, default=None)
+    sp.set_defaults(fn=cmd_messages_edit)
+
+    sp = m.add_parser("unsend", help="unsend a message (needs private API)")
+    sp.add_argument("guid")
+    sp.add_argument("--part-index", type=int, default=None)
+    sp.set_defaults(fn=cmd_messages_unsend)
+
+    # attachments
+    at = sub.add_parser("attach", help="attachment operations").add_subparsers(dest="sub", required=True)
+
+    sp = at.add_parser("download", help="download an attachment to a file")
+    sp.add_argument("guid")
+    sp.add_argument("-o", "--output", default=None, help="destination path")
+    sp.set_defaults(fn=cmd_attach_download)
+
+    sp = at.add_parser("send", help="send a file as an attachment")
+    sp.add_argument("chat", help="chat GUID/number/email")
+    sp.add_argument("file")
+    sp.add_argument("--method", default=None)
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_attach_send)
+
+    # contacts
+    ct = sub.add_parser("contacts", help="macOS Contacts via the server").add_subparsers(dest="sub", required=True)
+
+    sp = ct.add_parser("list", help="list contacts (client-side filter)")
+    sp.add_argument("--search", default=None, help="substring match on any field")
+    sp.add_argument("--limit", type=int, default=None)
+    sp.set_defaults(fn=cmd_contacts_list)
+
+    sp = ct.add_parser("get", help="get an iCloud contact card by address")
+    sp.add_argument("address")
+    sp.set_defaults(fn=cmd_contacts_get)
+
+    sp = ct.add_parser("query", help="query contacts by exact addresses")
+    sp.add_argument("addresses", nargs="+")
+    sp.set_defaults(fn=cmd_contacts_query)
+
+    # handles
+    h = sub.add_parser("handles", help="iMessage handle operations").add_subparsers(dest="sub", required=True)
+
+    sp = h.add_parser("get", help="get a handle by address")
+    sp.add_argument("address")
+    sp.set_defaults(fn=cmd_handles_get)
+
+    sp = h.add_parser("availability", help="iMessage/FaceTime availability")
+    sp.add_argument("address")
+    sp.add_argument("--kind", default="imessage", choices=["imessage", "facetime"])
+    sp.set_defaults(fn=cmd_handles_availability)
+
+    sp = h.add_parser("query", help="query handles")
+    sp.add_argument("--address", default=None)
+    sp.add_argument("--limit", type=int, default=100)
+    sp.set_defaults(fn=cmd_handles_query)
+
+    # scheduled messages
+    s = sub.add_parser("schedule", help="scheduled messages").add_subparsers(dest="sub", required=True)
+
+    s.add_parser("list", help="list scheduled messages").set_defaults(fn=cmd_schedule_list)
+
+    sp = s.add_parser("get", help="get scheduled message by ID")
+    sp.add_argument("id")
+    sp.set_defaults(fn=cmd_schedule_get)
+
+    sp = s.add_parser("create", help="schedule a message")
+    sp.add_argument("chat", help="chat GUID/number/email")
+    sp.add_argument("text")
+    sp.add_argument("--at", required=True, help="'YYYY-MM-DD HH:MM' or epoch seconds")
+    sp.add_argument("--method", default="apple-script", choices=["apple-script", "private-api"])
+    sp.set_defaults(fn=cmd_schedule_create)
+
+    sp = s.add_parser("update", help="reschedule a message")
+    sp.add_argument("id")
+    sp.add_argument("--at", required=True)
+    sp.set_defaults(fn=cmd_schedule_update)
+
+    sp = s.add_parser("delete", help="cancel a scheduled message")
+    sp.add_argument("id")
+    sp.set_defaults(fn=cmd_schedule_delete)
+
+    # find my
+    f = sub.add_parser("findmy", help="Find My (devices/friends)").add_subparsers(dest="sub", required=True)
+    f.add_parser("devices", help="my device locations").set_defaults(fn=cmd_findmy_devices)
+    f.add_parser("friends", help="friends' locations").set_defaults(fn=cmd_findmy_friends)
+
+    # raw escape hatch
+    sp = sub.add_parser("raw", help="raw API call: bub raw GET /api/v1/ping")
+    sp.add_argument("method")
+    sp.add_argument("path", help="e.g. /api/v1/server/info")
+    sp.add_argument("--param", dest="params", action="append", help="k=v query params (repeatable)")
+    sp.add_argument("--body", default=None, help="JSON request body")
+    sp.set_defaults(fn=cmd_raw)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    ctx = Ctx(args)
+    args.fn(ctx, args)
+
+
+if __name__ == "__main__":
+    main()
