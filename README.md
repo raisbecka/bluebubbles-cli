@@ -4,6 +4,8 @@ A **stdlib-only Python CLI** for the [BlueBubbles Server](https://bluebubbles.ap
 No pip dependencies — it runs anywhere Python 3.8+ does, including a bare Docker container.
 Designed for scripting and for AI agents that need to read/send iMessages and look up contacts.
 
+**Author:** Andrew Raisbeck
+
 ```
 ┌──────────────────┐        HTTPS/JSON        ┌──────────────────────┐
 │  any process     │ ───────────────────────► │  BlueBubbles Server  │
