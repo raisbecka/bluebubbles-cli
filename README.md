@@ -64,7 +64,7 @@ bub ping                                   # health check
 bub messages list --limit 10 --chat +15551234567
 bub messages send +15551234567 "On my way"
 bub messages send user@icloud.com "photo" --attach ~/Pictures/cat.jpg
-bub contacts list --search dentist
+bub contacts list --search "dentist"
 bub attach download <attachment-guid> -o /tmp/clip.mov
 bub schedule create +15551234567 "Good morning!" --at "2026-10-13 07:00"
 ```
